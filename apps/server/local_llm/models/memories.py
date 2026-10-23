@@ -56,23 +56,45 @@ class MemoriesTable:
         path: str | None = None,
         meta: dict | None = None,
         db: AsyncSession | None = None,
+        *,
+        memory_id: str | None = None,
+        created_at: int | None = None,
+        updated_at: int | None = None,
     ) -> MemoryModel | None:
         """Persist a new memory entry and return the created model."""
         async with get_async_db_context(db) as db:
             now = int(time.time())
             record = Memory(
-                id=str(uuid.uuid4()),
+                id=memory_id or str(uuid.uuid4()),
                 user_id=user_id,
                 type=self.normalize_memory_type(memory_type),
                 path=path,
                 content=content,
                 meta=meta,
-                created_at=now,
-                updated_at=now,
+                created_at=created_at if created_at is not None else now,
+                updated_at=updated_at if updated_at is not None else now,
             )
             db.add(record)
             await db.commit()
             return MemoryModel.model_validate(record) if record else None
+
+    async def restore_memory(self, memory: MemoryModel, db: AsyncSession | None = None) -> MemoryModel | None:
+        """Restore an exact memory snapshot during a failed vector operation."""
+        async with get_async_db_context(db) as db:
+            record = await db.get(Memory, memory.id)
+            if record is None:
+                record = Memory(id=memory.id)
+                db.add(record)
+
+            record.user_id = memory.user_id
+            record.type = self.normalize_memory_type(memory.type)
+            record.path = memory.path
+            record.content = memory.content
+            record.meta = memory.meta
+            record.created_at = memory.created_at
+            record.updated_at = memory.updated_at
+            await db.commit()
+            return MemoryModel.model_validate(record)
 
     async def update_memory_by_id_and_user_id(
         self,
@@ -106,7 +128,7 @@ class MemoriesTable:
             except Exception:
                 return None
 
-    async def get_memories(self, db: AsyncSession | None = None) -> list[MemoryModel]:
+    async def get_memories(self, db: AsyncSession | None = None) -> list[MemoryModel] | None:
         async with get_async_db_context(db) as db:
             try:
                 result = await db.execute(select(Memory))
@@ -115,7 +137,7 @@ class MemoriesTable:
             except Exception:
                 return None
 
-    async def get_memories_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> list[MemoryModel]:
+    async def get_memories_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> list[MemoryModel] | None:
         async with get_async_db_context(db) as db:
             try:
                 result = await db.execute(select(Memory).filter_by(user_id=user_id))

@@ -30,7 +30,6 @@ from local_llm.models.messages import Messages
 from local_llm.models.notes import Notes
 from local_llm.models.users import UserModel
 from local_llm.retrieval.utils import get_content_from_url
-from local_llm.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from local_llm.routers.images import (
     CreateImageForm,
     EditImageForm,
@@ -49,6 +48,7 @@ from local_llm.routers.memories import (
 from local_llm.routers.memories import (
     add_memory as _add_memory,
 )
+from local_llm.routers.memories import delete_memory_by_id as _delete_memory_by_id
 from local_llm.routers.memories import (
     list_memory_paths as _list_memory_paths,
 )
@@ -1066,10 +1066,9 @@ async def delete_memory(
     try:
         user = UserModel(**__user__) if __user__ else None
 
-        result = await Memories.delete_memory_by_id_and_user_id(memory_id, user.id)
+        result = await _delete_memory_by_id(memory_id=memory_id, request=__request__, user=user)
 
         if result:
-            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=f'user-memory-{user.id}', ids=[memory_id])
             return JSONCodec.dumps(
                 {'status': 'success', 'message': f'Memory {memory_id} deleted'},
                 ensure_ascii=False,

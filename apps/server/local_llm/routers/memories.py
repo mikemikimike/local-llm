@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Awaitable, Callable
 from typing import Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
@@ -16,6 +19,7 @@ from local_llm.models.config import Config
 from local_llm.models.memories import Memories, MemoryModel
 from local_llm.models.users import Users
 from local_llm.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
+from local_llm.retrieval.vector.main import SearchResult
 from local_llm.utils.access_control import has_permission
 from local_llm.utils.auth import get_admin_user, get_verified_user
 from local_llm.utils.memory import (
@@ -133,15 +137,19 @@ async def reindex_memory_vectors_for_user(
     user=None,
 ) -> int:
     collection_name = f'user-memory-{user_id}'
-    try:
-        await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name)
-    except Exception as e:
-        log.debug(e)
-
-    memories = memories if memories is not None else await Memories.get_memories_by_user_id(user_id)
-    memories = memories or []
+    if memories is None:
+        memories = await Memories.get_memories_by_user_id(user_id)
+        if memories is None:
+            raise RuntimeError(f'Unable to load memories for user {user_id}')
     if not memories:
+        try:
+            await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name)
+        except Exception as e:
+            log.debug(e)
         return 0
+
+    # Build every embedding before touching the existing collection. A failed
+    # model load must leave the last known-good vectors available for recall.
 
     vectors = await asyncio.gather(
         *[
@@ -154,31 +162,445 @@ async def reindex_memory_vectors_for_user(
         ]
     )
 
-    await ASYNC_VECTOR_DB_CLIENT.upsert(
-        collection_name=collection_name,
-        items=[
-            {
-                'id': memory.id,
-                'text': memory_vector_text(memory.content, memory.path),
-                'vector': vectors[idx],
-                'metadata': _memory_metadata(memory),
-            }
-            for idx, memory in enumerate(memories)
-        ],
-    )
+    items = [
+        {
+            'id': memory.id,
+            'text': memory_vector_text(memory.content, memory.path),
+            'vector': vectors[idx],
+            'metadata': _memory_metadata(memory),
+        }
+        for idx, memory in enumerate(memories)
+    ]
+    existing_ids: set[str] = set()
+    try:
+        existing = await ASYNC_VECTOR_DB_CLIENT.get(collection_name)
+        if existing and existing.ids and existing.ids[0]:
+            existing_ids = set(existing.ids[0])
+    except Exception as e:
+        log.debug('Unable to inspect existing memory vectors for %s: %s', user_id, e)
+
+    replaced_collection = False
+    try:
+        await ASYNC_VECTOR_DB_CLIENT.upsert(collection_name=collection_name, items=items)
+    except Exception as e:
+        if not _is_dimension_mismatch(e):
+            raise
+
+        # A collection created with a previous embedding model cannot accept
+        # vectors with the new dimension.  All embeddings are ready now, so it
+        # is safe to replace the collection after this point.
+        await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name)
+        await ASYNC_VECTOR_DB_CLIENT.upsert(collection_name=collection_name, items=items)
+        replaced_collection = True
+
+    if not replaced_collection:
+        stale_ids = existing_ids - {memory.id for memory in memories}
+        if stale_ids:
+            try:
+                await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=collection_name, ids=sorted(stale_ids))
+            except Exception as e:
+                # Keeping an old vector is safer than losing the complete collection.
+                log.warning('Unable to remove stale memory vectors for %s: %s', user_id, e)
     return len(memories)
 
 
-async def upsert_memory_vectors_or_reindex(request: Request, user, items: list[dict]) -> None:
+async def upsert_memory_vectors_or_reindex(
+    request: Request,
+    user,
+    items: list[dict],
+    memories: list[MemoryModel] | None = None,
+) -> None:
     try:
         await ASYNC_VECTOR_DB_CLIENT.upsert(collection_name=f'user-memory-{user.id}', items=items)
     except Exception as e:
-        message = str(e).lower()
-        if 'dimension' not in message or 'embedding' not in message:
+        if not _is_dimension_mismatch(e):
             raise
 
         log.warning('Memory vector dimension mismatch for user %s; reindexing memory vectors.', user.id)
-        await reindex_memory_vectors_for_user(request, user.id, user=user)
+        await reindex_memory_vectors_for_user(request, user.id, memories=memories, user=user)
+
+
+def _is_dimension_mismatch(error: Exception) -> bool:
+    message = str(error).lower()
+    return 'dimension' in message and 'embedding' in message
+
+
+def _memory_vector_item(memory: MemoryModel, vector: list[float | int]) -> dict:
+    return {
+        'id': memory.id,
+        'text': memory_vector_text(memory.content, memory.path),
+        'vector': vector,
+        'metadata': _memory_metadata(memory),
+    }
+
+
+def _authoritative_memory_results(results, memories: list[MemoryModel]) -> SearchResult:
+    """Replace vector payloads with current database rows and drop orphan IDs."""
+    memory_by_id = {memory.id: memory for memory in memories}
+    ids = results.ids[0] if results and results.ids and results.ids[0] else []
+    distances = results.distances[0] if results and results.distances and results.distances[0] else []
+    resolved_ids = []
+    documents = []
+    metadatas = []
+    resolved_distances = []
+    for idx, memory_id in enumerate(ids):
+        memory = memory_by_id.get(memory_id)
+        if memory is None:
+            continue
+        resolved_ids.append(memory.id)
+        documents.append(memory_vector_text(memory.content, memory.path))
+        metadatas.append(_memory_metadata(memory))
+        if results.distances is not None:
+            resolved_distances.append(distances[idx] if idx < len(distances) else 0)
+
+    return SearchResult(
+        ids=[resolved_ids],
+        documents=[documents],
+        metadatas=[metadatas],
+        distances=[resolved_distances] if results.distances is not None else None,
+    )
+
+
+def _memory_candidate(
+    *,
+    user_id: str,
+    content: str,
+    memory_type: str,
+    path: str | None,
+    meta: dict | None,
+    existing: MemoryModel | None = None,
+) -> MemoryModel:
+    now = int(time.time())
+    return MemoryModel(
+        id=existing.id if existing else str(uuid4()),
+        user_id=user_id,
+        type=memory_type,
+        path=path,
+        content=content,
+        meta=meta,
+        created_at=existing.created_at if existing else now,
+        updated_at=now,
+    )
+
+
+async def _prepare_memory_operations(
+    request: Request,
+    user,
+    operations: list[dict],
+    *,
+    deduplicate_adds: bool = True,
+) -> list[dict]:
+    """Resolve rows and embeddings before the first mutation in a batch."""
+    existing_memories = await Memories.get_memories_by_user_id(user.id)
+    if existing_memories is None:
+        raise RuntimeError(f'Unable to load memories for user {user.id}')
+    working_memories = list(existing_memories)
+    prepared = []
+    for operation in operations:
+        action = operation.get('action')
+        if action == 'add':
+            content = operation.get('content', '').strip()
+            memory_type = Memories.normalize_memory_type(operation.get('type'))
+            path = operation.get('path')
+            if deduplicate_adds:
+                duplicate = next(
+                    (
+                        memory
+                        for memory in working_memories
+                        if memory.content == content and memory.type == memory_type and memory.path == path
+                    ),
+                    None,
+                )
+                if duplicate:
+                    prepared.append({'operation': operation, 'duplicate': duplicate})
+                    continue
+
+            memory = _memory_candidate(
+                user_id=user.id,
+                content=content,
+                memory_type=memory_type,
+                path=path,
+                meta=operation.get('meta'),
+            )
+            vector = await request.app.state.EMBEDDING_FUNCTION(
+                memory_vector_text(memory.content, memory.path),
+                prefix=RAG_EMBEDDING_CONTENT_PREFIX,
+                user=user,
+            )
+            previous_memories = list(working_memories)
+            working_memories.append(memory)
+            prepared.append(
+                {
+                    'operation': operation,
+                    'memory': memory,
+                    'new_vector': vector,
+                    'previous_memories': previous_memories,
+                    'vector_memories': list(working_memories),
+                }
+            )
+            continue
+
+        memory = next((item for item in working_memories if item.id == operation.get('id')), None)
+        if memory is None:
+            raise ValueError(f'Memory not found: {operation.get("id")}')
+        if action in {'replace', 'move'}:
+            content = operation.get('content', memory.content).strip() if action == 'replace' else memory.content
+            memory_type = (
+                Memories.normalize_memory_type(operation.get('type'))
+                if operation.get('type') is not None
+                else memory.type
+            )
+            path = operation.get('path') if 'path' in operation else memory.path
+            meta = memory.meta
+            if operation.get('meta') is not None:
+                meta = {**(memory.meta or {}), **operation['meta']}
+            candidate = _memory_candidate(
+                user_id=user.id,
+                content=content,
+                memory_type=memory_type,
+                path=path,
+                meta=meta,
+                existing=memory,
+            )
+            prepared_item = {'operation': operation, 'old_memory': memory, 'memory': candidate}
+            old_text = memory_vector_text(memory.content, memory.path)
+            new_text = memory_vector_text(candidate.content, candidate.path)
+            if old_text != new_text:
+                prepared_item['old_vector'] = await request.app.state.EMBEDDING_FUNCTION(
+                    old_text,
+                    prefix=RAG_EMBEDDING_CONTENT_PREFIX,
+                    user=user,
+                )
+                prepared_item['new_vector'] = await request.app.state.EMBEDDING_FUNCTION(
+                    new_text,
+                    prefix=RAG_EMBEDDING_CONTENT_PREFIX,
+                    user=user,
+                )
+            prepared_item['previous_memories'] = list(working_memories)
+            working_memories = [candidate if item.id == candidate.id else item for item in working_memories]
+            prepared_item['vector_memories'] = list(working_memories)
+            prepared.append(prepared_item)
+            continue
+
+        if action == 'remove':
+            old_vector = await request.app.state.EMBEDDING_FUNCTION(
+                memory_vector_text(memory.content, memory.path),
+                prefix=RAG_EMBEDDING_CONTENT_PREFIX,
+                user=user,
+            )
+            previous_memories = list(working_memories)
+            working_memories = [item for item in working_memories if item.id != memory.id]
+            prepared.append(
+                {
+                    'operation': operation,
+                    'old_memory': memory,
+                    'old_vector': old_vector,
+                    'previous_memories': previous_memories,
+                    'vector_memories': list(working_memories),
+                }
+            )
+            continue
+
+        raise ValueError(f'Unsupported memory operation: {action}')
+
+    return prepared
+
+
+async def _best_effort_delete_vector(user_id: str, memory_id: str) -> None:
+    try:
+        await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=f'user-memory-{user_id}', ids=[memory_id])
+    except Exception:
+        log.exception('Unable to compensate vector delete for memory %s', memory_id)
+
+
+async def _best_effort_restore_vector(
+    request: Request,
+    user,
+    memory: MemoryModel,
+    vector: list[float | int] | None,
+    memories: list[MemoryModel],
+) -> None:
+    if vector is None:
+        return
+    try:
+        await upsert_memory_vectors_or_reindex(
+            request,
+            user,
+            [_memory_vector_item(memory, vector)],
+            memories=memories,
+        )
+    except Exception:
+        log.exception('Unable to compensate vector change for memory %s', memory.id)
+
+
+async def _apply_prepared_memory_operation(
+    request: Request,
+    user,
+    prepared: dict,
+) -> tuple[dict, Callable[[], Awaitable[None]] | None]:
+    operation = prepared['operation']
+    action = operation.get('action')
+    duplicate = prepared.get('duplicate')
+    if duplicate:
+        return {
+            'action': action,
+            'status': 'skipped',
+            'memory': duplicate,
+            'reason': 'duplicate',
+        }, None
+
+    if action == 'add':
+        memory = prepared['memory']
+        item = _memory_vector_item(memory, prepared['new_vector'])
+        try:
+            await upsert_memory_vectors_or_reindex(
+                request,
+                user,
+                [item],
+                memories=prepared['vector_memories'],
+            )
+        except Exception:
+            await _best_effort_delete_vector(user.id, memory.id)
+            raise
+        try:
+            saved = await Memories.insert_new_memory(
+                user.id,
+                memory.content,
+                memory_type=memory.type,
+                path=memory.path,
+                meta=memory.meta,
+                memory_id=memory.id,
+                created_at=memory.created_at,
+                updated_at=memory.updated_at,
+            )
+            if saved is None:
+                raise RuntimeError(f'Unable to create memory: {memory.id}')
+        except Exception:
+            await _best_effort_delete_vector(user.id, memory.id)
+            raise
+
+        async def undo_add() -> None:
+            deleted = await Memories.delete_memory_by_id_and_user_id(memory.id, user.id)
+            if deleted:
+                await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=f'user-memory-{user.id}', ids=[memory.id])
+
+        return {'action': action, 'status': 'created', 'memory': saved}, undo_add
+
+    old_memory = prepared['old_memory']
+    if action in {'replace', 'move'}:
+        memory = prepared['memory']
+        new_vector = prepared.get('new_vector')
+        old_vector = prepared.get('old_vector')
+        if new_vector is not None:
+            try:
+                await upsert_memory_vectors_or_reindex(
+                    request,
+                    user,
+                    [_memory_vector_item(memory, new_vector)],
+                    memories=prepared['vector_memories'],
+                )
+            except Exception:
+                await _best_effort_restore_vector(
+                    request,
+                    user,
+                    old_memory,
+                    old_vector,
+                    prepared['previous_memories'],
+                )
+                raise
+        try:
+            updated = await Memories.update_memory_by_id_and_user_id(
+                memory.id,
+                user.id,
+                memory.content,
+                memory_type=memory.type,
+                path=memory.path,
+                update_path=True,
+                meta=operation.get('meta'),
+            )
+            if updated is None:
+                raise ValueError(f'Memory not found: {memory.id}')
+        except Exception:
+            await _best_effort_restore_vector(
+                request,
+                user,
+                old_memory,
+                old_vector,
+                prepared['previous_memories'],
+            )
+            raise
+
+        async def undo_update() -> None:
+            await _best_effort_restore_vector(
+                request,
+                user,
+                old_memory,
+                old_vector,
+                prepared['previous_memories'],
+            )
+            await Memories.restore_memory(old_memory)
+
+        return {'action': action, 'status': 'updated', 'memory': updated}, undo_update
+
+    if action == 'remove':
+        old_vector = prepared['old_vector']
+        try:
+            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=f'user-memory-{user.id}', ids=[old_memory.id])
+        except Exception:
+            await _best_effort_restore_vector(
+                request,
+                user,
+                old_memory,
+                old_vector,
+                prepared['previous_memories'],
+            )
+            raise
+        try:
+            deleted = await Memories.delete_memory_by_id_and_user_id(old_memory.id, user.id)
+            if not deleted:
+                raise ValueError(f'Memory not found: {old_memory.id}')
+        except Exception:
+            await _best_effort_restore_vector(
+                request,
+                user,
+                old_memory,
+                old_vector,
+                prepared['previous_memories'],
+            )
+            raise
+
+        async def undo_remove() -> None:
+            await Memories.restore_memory(old_memory)
+            await _best_effort_restore_vector(
+                request,
+                user,
+                old_memory,
+                old_vector,
+                prepared['previous_memories'],
+            )
+
+        return {'action': action, 'status': 'deleted', 'id': old_memory.id}, undo_remove
+
+    raise ValueError(f'Unsupported memory operation: {action}')
+
+
+async def _apply_prepared_memory_operations(request: Request, user, prepared_operations: list[dict]) -> list[dict]:
+    results = []
+    undo_operations = []
+    try:
+        for prepared in prepared_operations:
+            result, undo = await _apply_prepared_memory_operation(request, user, prepared)
+            results.append(result)
+            if undo is not None:
+                undo_operations.append(undo)
+    except Exception:
+        for undo in reversed(undo_operations):
+            try:
+                await undo()
+            except Exception:
+                log.exception('Unable to roll back a memory operation')
+        raise
+    return results
 
 
 @router.post('/add', response_model=MemoryModel | None)
@@ -197,30 +619,22 @@ async def add_memory(
 
     content = clean_memory_content(form_data.content)
     path = clean_memory_path(form_data.path)
-    memory = await Memories.insert_new_memory(
-        user.id,
-        content,
-        memory_type=form_data.type,
-        path=path,
-        meta={'created_by': 'manual'},
-    )
-
-    vector = await request.app.state.EMBEDDING_FUNCTION(
-        memory_vector_text(memory.content, memory.path), prefix=RAG_EMBEDDING_CONTENT_PREFIX, user=user
-    )
-
-    await upsert_memory_vectors_or_reindex(
+    prepared = await _prepare_memory_operations(
         request,
         user,
         [
             {
-                'id': memory.id,
-                'text': memory_vector_text(memory.content, memory.path),
-                'vector': vector,
-                'metadata': _memory_metadata(memory),
+                'action': 'add',
+                'content': content,
+                'type': form_data.type,
+                'path': path,
+                'meta': {'created_by': 'manual'},
             }
         ],
+        deduplicate_adds=False,
     )
+    results = await _apply_prepared_memory_operations(request, user, prepared)
+    memory = results[0]['memory']
 
     await publish_event(
         request,
@@ -253,41 +667,17 @@ async def update_memories(
             }
 
     try:
-        results = await Memories.apply_memory_operations(user.id, operations)
+        prepared = await _prepare_memory_operations(request, user, operations)
+        results = await _apply_prepared_memory_operations(request, user, prepared)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
-    upsert_items = []
-    delete_ids = []
     response = []
-
     for result in results:
         memory = result.get('memory')
         if isinstance(memory, MemoryModel):
             result = {**result, 'memory': memory.model_dump()}
-            if result.get('status') in {'created', 'updated'}:
-                vector = await request.app.state.EMBEDDING_FUNCTION(
-                    memory_vector_text(memory.content, memory.path),
-                    prefix=RAG_EMBEDDING_CONTENT_PREFIX,
-                    user=user,
-                )
-                upsert_items.append(
-                    {
-                        'id': memory.id,
-                        'text': memory_vector_text(memory.content, memory.path),
-                        'vector': vector,
-                        'metadata': _memory_metadata(memory),
-                    }
-                )
-        if result.get('status') == 'deleted' and result.get('id'):
-            delete_ids.append(result['id'])
         response.append(result)
-
-    if upsert_items:
-        await upsert_memory_vectors_or_reindex(request, user, upsert_items)
-
-    if delete_ids:
-        await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=f'user-memory-{user.id}', ids=delete_ids)
 
     for result in response:
         status_value = result.get('status')
@@ -361,8 +751,6 @@ async def query_memory(
     # better).
     relevance_threshold = await Config.get('rag.relevance_threshold', 0.0)
     if results and relevance_threshold > 0.0 and results.distances and results.distances[0]:
-        from local_llm.retrieval.vector.main import SearchResult
-
         filtered_ids = []
         filtered_docs = []
         filtered_metas = []
@@ -385,7 +773,7 @@ async def query_memory(
             distances=[filtered_dists] if filtered_dists else [[]],
         )
 
-    return results
+    return _authoritative_memory_results(results, memories) if results is not None else None
 
 
 @router.post('/search', response_model=list[MemoryModel])
@@ -452,7 +840,8 @@ async def reindex_memories_from_vector_db(
     user=Depends(get_admin_user),
 ):
     memories = await Memories.get_memories()
-    memories = memories or []
+    if memories is None:
+        raise RuntimeError('Unable to load memories for reindex')
     memories_by_user_id = {}
     for memory in memories:
         memories_by_user_id.setdefault(memory.user_id, []).append(memory)
@@ -460,14 +849,19 @@ async def reindex_memories_from_vector_db(
     users_result = await Users.get_users()
     users = users_result.get('users', []) if users_result else []
     total_memories = 0
+    failed_users = []
 
     for memory_user in users:
-        total_memories += await reindex_memory_vectors_for_user(
-            request,
-            memory_user.id,
-            memories=memories_by_user_id.get(memory_user.id, []),
-            user=memory_user,
-        )
+        try:
+            total_memories += await reindex_memory_vectors_for_user(
+                request,
+                memory_user.id,
+                memories=memories_by_user_id.get(memory_user.id, []),
+                user=memory_user,
+            )
+        except Exception:
+            failed_users.append(memory_user.id)
+            log.exception('Unable to reindex memory vectors for user %s', memory_user.id)
 
     await publish_event(
         request,
@@ -475,9 +869,19 @@ async def reindex_memories_from_vector_db(
         actor=user,
         subject_id='all',
         subject_type='user',
-        data={'count': total_memories, 'user_count': len(users), 'reindex': True},
+        data={
+            'count': total_memories,
+            'user_count': len(users),
+            'failed_user_count': len(failed_users),
+            'reindex': True,
+        },
     )
-    return {'status': True, 'total_users': len(users), 'total_memories': total_memories}
+    return {
+        'status': not failed_users,
+        'total_users': len(users),
+        'total_memories': total_memories,
+        'failed_users': failed_users,
+    }
 
 
 @router.post('/reset', response_model=bool)
@@ -521,13 +925,26 @@ async def delete_memory_by_user_id(
 ):
     await check_memories_permission(user)
 
-    result = await Memories.delete_memories_by_user_id(user.id, db=db)
+    memories = await Memories.get_memories_by_user_id(user.id, db=db)
+    if memories is None:
+        return False
+    try:
+        await ASYNC_VECTOR_DB_CLIENT.delete_collection(f'user-memory-{user.id}')
+    except Exception as e:
+        log.error('Unable to delete memory vectors for user %s: %s', user.id, e)
+        return False
+
+    try:
+        result = await Memories.delete_memories_by_user_id(user.id, db=db)
+    except Exception:
+        if memories:
+            try:
+                await reindex_memory_vectors_for_user(request, user.id, memories=memories, user=user)
+            except Exception:
+                log.exception('Unable to restore memory vectors after database deletion failure for user %s', user.id)
+        raise
 
     if result:
-        try:
-            await ASYNC_VECTOR_DB_CLIENT.delete_collection(f'user-memory-{user.id}')
-        except Exception as e:
-            log.error(e)
         await publish_event(
             request,
             EVENTS.MEMORY_DELETED,
@@ -536,6 +953,12 @@ async def delete_memory_by_user_id(
             subject_type='user',
         )
         return True
+
+    if memories:
+        try:
+            await reindex_memory_vectors_for_user(request, user.id, memories=memories, user=user)
+        except Exception:
+            log.exception('Unable to restore memory vectors after database deletion failure for user %s', user.id)
 
     return False
 
@@ -562,35 +985,27 @@ async def update_memory_by_id(
     path = clean_memory_path(form_data.path)
     if content is None and form_data.type is None and form_data.path is None:
         raise HTTPException(status_code=400, detail='No memory update provided')
-    memory = await Memories.update_memory_by_id_and_user_id(
-        memory_id,
-        user.id,
-        content,
-        memory_type=form_data.type,
-        path=path,
-        update_path=form_data.path is not None,
-        meta={'created_by': 'manual'},
-    )
-    if memory is None:
+    operation = {
+        'action': 'replace',
+        'id': memory_id,
+        'meta': {'created_by': 'manual'},
+    }
+    if content is not None:
+        operation['content'] = content
+    if form_data.type is not None:
+        operation['type'] = form_data.type
+    if form_data.path is not None:
+        operation['path'] = path
+
+    try:
+        prepared = await _prepare_memory_operations(request, user, [operation])
+        results = await _apply_prepared_memory_operations(request, user, prepared)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND) from e
+
+    memory = results[0].get('memory')
+    if not isinstance(memory, MemoryModel):
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
-
-    if form_data.content is not None or form_data.path is not None:
-        vector = await request.app.state.EMBEDDING_FUNCTION(
-            memory_vector_text(memory.content, memory.path), prefix=RAG_EMBEDDING_CONTENT_PREFIX, user=user
-        )
-
-        await upsert_memory_vectors_or_reindex(
-            request,
-            user,
-            [
-                {
-                    'id': memory.id,
-                    'text': memory_vector_text(memory.content, memory.path),
-                    'vector': vector,
-                    'metadata': _memory_metadata(memory),
-                }
-            ],
-        )
 
     await publish_event(
         request,
@@ -612,14 +1027,20 @@ async def delete_memory_by_id(
     memory_id: str,
     request: Request,
     user=Depends(get_verified_user),
-    db: AsyncSession = Depends(get_async_session),
 ):
     await check_memories_permission(user)
 
-    result = await Memories.delete_memory_by_id_and_user_id(memory_id, user.id, db=db)
+    try:
+        prepared = await _prepare_memory_operations(
+            request,
+            user,
+            [{'action': 'remove', 'id': memory_id}],
+        )
+        results = await _apply_prepared_memory_operations(request, user, prepared)
+    except ValueError:
+        return False
 
-    if result:
-        await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=f'user-memory-{user.id}', ids=[memory_id])
+    if results and results[0].get('status') == 'deleted':
         await publish_event(
             request,
             EVENTS.MEMORY_DELETED,

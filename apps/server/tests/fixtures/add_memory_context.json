@@ -90,7 +90,7 @@
   "messages": [
    {
     "role": "system",
-    "content": "<memory_context>\n[User Memory]\n- Likes jazz\n- Prefers metric units\n- profile/health: allergic to nuts\n- profile: Name is Ada\n\n[Memory Neighborhood]\n- home/garden: Garden faces south\n- home/kitchen/fridge: Fridge is older\n- home/kitchen: Kitchen has a gas stove\n- work/project: Project deadline is Friday\n\n[Relevant Context]\n- orphan doc\n</memory_context>"
+    "content": "<memory_context>\n[User Memory]\n- Prefers metric units\n- profile/health: allergic to nuts\n- profile: Name is Ada\n\n[Memory Neighborhood]\n- home/garden: Garden faces south\n- home/kitchen/fridge: Fridge is older\n- home/kitchen: Kitchen has a gas stove\n- work/project: Project deadline is Friday\n</memory_context>"
    },
    {
     "role": "user",
@@ -105,10 +105,6 @@
  "vector_hits_only": {
   "same_object": true,
   "messages": [
-   {
-    "role": "system",
-    "content": "<memory_context>\n[User Memory]\n- Likes jazz\n\n[Relevant Context]\n- home/kitchen: Kitchen has a gas stove\n- orphan doc\n- work/project: Project deadline is Friday\n</memory_context>"
-   },
    {
     "role": "user",
     "content": "anything"
@@ -174,10 +170,6 @@
   "same_object": true,
   "messages": [
    {
-    "role": "system",
-    "content": "<memory_context>\n[Relevant Context]\n- a\n- b\n</memory_context>"
-   },
-   {
     "role": "user",
     "content": "x"
    }
@@ -190,10 +182,6 @@
  "vector_metadata_path_not_a_prefix": {
   "same_object": true,
   "messages": [
-   {
-    "role": "system",
-    "content": "<memory_context>\n[Relevant Context]\n- some/path: no prefix here\n</memory_context>"
-   },
    {
     "role": "user",
     "content": "x"
@@ -384,7 +372,7 @@
   "messages": [
    {
     "role": "system",
-    "content": "<memory_context>\n[User Memory]\n- Likes jazz\n- Prefers metric units\n- profile/health: allergic to nuts\n- profile: Name is Ada\n\n[Memory Neighborhood]\n- home/garden: Garden faces south\n- home/kitchen/fridge: Fridge is older\n- home/kitchen: Kitchen has a gas stove\n- work/project: Project deadline is Friday\n\n[Relevant Context]\n- orphan doc\n</memory_context>"
+    "content": "<memory_context>\n[User Memory]\n- Prefers metric units\n- profile/health: allergic to nuts\n- profile: Name is Ada\n\n[Memory Neighborhood]\n- home/garden: Garden faces south\n- home/kitchen/fridge: Fridge is older\n- home/kitchen: Kitchen has a gas stove\n- work/project: Project deadline is Friday\n</memory_context>"
    },
    {
     "role": "user",

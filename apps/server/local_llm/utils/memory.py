@@ -254,7 +254,9 @@ def validate_memory_operations(form_data) -> list[dict]:
 
     operations = []
     for operation in form_data.operations:
-        op = operation.model_dump()
+        # Preserve whether optional fields were omitted.  A replace without a
+        # path must keep its existing path, while an explicit null clears it.
+        op = operation.model_dump(exclude_unset=True)
         action = op.get('action')
 
         if action == 'add':
@@ -267,7 +269,8 @@ def validate_memory_operations(form_data) -> list[dict]:
             op['content'] = clean_memory_content(op.get('content'))
             if op.get('type') is not None:
                 op['type'] = Memories.normalize_memory_type(op.get('type'))
-            op['path'] = clean_memory_path(op.get('path'))
+            if 'path' in op:
+                op['path'] = clean_memory_path(op.get('path'))
         elif action == 'move':
             if not op.get('id'):
                 raise HTTPException(status_code=400, detail='Memory id is required for move')
@@ -312,30 +315,22 @@ async def _vector_memory_results(request, query: str, user):
         return None
 
 
-def _vector_hit_labels(results, seen_ids: set) -> list[tuple[str, str]]:
-    """(section, label) for each vector hit not already shown, with its path prefix moved into the label."""
-    if not (results and hasattr(results, 'documents') and results.documents):
+def _vector_hit_labels(results, seen_ids: set, memories: list | None = None) -> list[tuple[str, str]]:
+    """Resolve vector hits against current database rows before rendering them."""
+    if not (results and getattr(results, 'ids', None) and results.ids[0]):
         return []
-    labels = []
-    for doc_idx, doc in enumerate(results.documents[0]):
-        if not doc:
-            continue
-        metadata = {}
-        if results.metadatas and results.metadatas[0] and len(results.metadatas[0]) > doc_idx:
-            metadata = results.metadatas[0][doc_idx] or {}
-        memory_id = None
-        if results.ids and results.ids[0] and len(results.ids[0]) > doc_idx:
-            memory_id = results.ids[0][doc_idx]
-        if memory_id and memory_id in seen_ids:
-            continue
-        if memory_id:
-            seen_ids.add(memory_id)
 
-        content = str(doc)
-        path = metadata.get('path')
-        if path and content.startswith(f'{path}\n'):
-            content = content[len(path) + 1 :]
-        labels.append((Memories.normalize_memory_type(metadata.get('type')), f'{path}: {content}' if path else content))
+    memories_by_id = {memory.id: memory for memory in memories or []}
+    if not memories_by_id:
+        return []
+
+    labels = []
+    for memory_id in results.ids[0]:
+        memory = memories_by_id.get(memory_id)
+        if memory is None or memory.id in seen_ids:
+            continue
+        seen_ids.add(memory.id)
+        labels.append((Memories.normalize_memory_type(memory.type), memory_label(memory)))
     return labels
 
 
@@ -357,7 +352,7 @@ def _memory_sections(all_memories: list, query: str, results) -> dict[str, list[
             seen_ids.add(memory.id)
             sections['neighborhood'].append(memory_label(memory))
 
-    for section, label in _vector_hit_labels(results, seen_ids):
+    for section, label in _vector_hit_labels(results, seen_ids, all_memories):
         sections[section].append(label)
     return sections
 
