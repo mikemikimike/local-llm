@@ -40,6 +40,8 @@ from local_llm.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from local_llm.routers.retrieval import (
     BatchProcessFilesForm,
     ProcessFileForm,
+    ReindexProcessFileForm,
+    get_retrieval_config,
     process_file,
     process_files_batch,
 )
@@ -371,66 +373,102 @@ async def reindex_knowledge_files(
         for knowledge_base in knowledge_bases
     ]
     total_files = sum(len(files) for _, files in knowledge_base_files)
+    if total_files and (await get_retrieval_config()).BYPASS_EMBEDDING_AND_RETRIEVAL:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Knowledge reindexing is unavailable while embedding and retrieval are bypassed',
+        )
+
+    reindex_lock = getattr(request.app.state, 'knowledge_reindex_lock', None)
+    if reindex_lock is None:
+        reindex_lock = asyncio.Lock()
+        request.app.state.knowledge_reindex_lock = reindex_lock
+
     processed_files = 0
-    failed_files = []
+    failed_files: list[dict[str, str]] = []
     start_time = time.monotonic()
 
     log.info('Starting reindexing for %s knowledge bases (%s files)', len(knowledge_bases), total_files)
 
     for kb_idx, (knowledge_base, files) in enumerate(knowledge_base_files, start=1):
-        try:
+        for file in files:
+            processed_files += 1
+            eta = ''
+            if processed_files > 1:
+                elapsed = time.monotonic() - start_time
+                remaining_files = total_files - processed_files + 1
+                eta = f', ETA: {round(elapsed / (processed_files - 1) * remaining_files)}s'
+
+            log.info(
+                'Reindexing knowledge base %s/%s file %s/%s%s: %s',
+                kb_idx,
+                len(knowledge_bases),
+                processed_files,
+                total_files,
+                eta,
+                file.filename,
+            )
+
             try:
-                if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=knowledge_base.id):
-                    await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=knowledge_base.id)
-            except Exception as e:
-                log.error(f'Error deleting collection {knowledge_base.id}: {str(e)}')
-                continue  # Skip, don't raise
-
-            for file in files:
-                processed_files += 1
-                eta = ''
-                if processed_files > 1:
-                    elapsed = time.monotonic() - start_time
-                    remaining_files = total_files - processed_files + 1
-                    eta = f', ETA: {round(elapsed / (processed_files - 1) * remaining_files)}s'
-
-                log.info(
-                    'Reindexing knowledge base %s/%s file %s/%s%s: %s',
-                    kb_idx,
-                    len(knowledge_bases),
-                    processed_files,
-                    total_files,
-                    eta,
-                    file.filename,
-                )
-
-                try:
-                    # Force the KB add path to use stored SQL content instead of stale file-{id} chunks.
-                    # process_file recreates file-{id} only when that stored content exists.
+                async with reindex_lock:
                     file_collection = f'file-{file.id}'
-                    if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=file_collection):
-                        await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=file_collection)
+                    reindex_collections = (knowledge_base.id, file_collection)
+                    old_vector_ids: dict[str, list[str]] = {name: [] for name in reindex_collections}
+                    for collection_name in reindex_collections:
+                        if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
+                            vectors = await ASYNC_VECTOR_DB_CLIENT.query(
+                                collection_name=collection_name,
+                                filter={'file_id': file.id},
+                            )
+                            if vectors and vectors.ids and vectors.ids[0]:
+                                old_vector_ids[collection_name] = vectors.ids[0]
 
-                    await process_file(
-                        request,
-                        ProcessFileForm(file_id=file.id, collection_name=knowledge_base.id),
-                        user=user,
-                        db=db,
-                    )
-                except Exception as e:
-                    log.error(f'Error processing file {file.filename} (ID: {file.id}): {str(e)}')
-                    failed_files.append({'file_id': file.id, 'error': str(e)})
-                    continue
+                    try:
+                        result = await process_file(
+                            request,
+                            ReindexProcessFileForm(file_id=file.id, collection_name=knowledge_base.id),
+                            user=user,
+                            db=db,
+                        )
+                        if not isinstance(result, dict) or result.get('status') is not True:
+                            raise RuntimeError(f'File reindex did not complete successfully: {file.id}')
+                    except Exception:
+                        for collection_name in reindex_collections:
+                            if not await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
+                                continue
+                            vectors = await ASYNC_VECTOR_DB_CLIENT.query(
+                                collection_name=collection_name,
+                                filter={'file_id': file.id},
+                            )
+                            current_ids = vectors.ids[0] if vectors and vectors.ids else []
+                            new_vector_ids = [
+                                vector_id
+                                for vector_id in current_ids
+                                if vector_id not in old_vector_ids[collection_name]
+                            ]
+                            if new_vector_ids:
+                                await ASYNC_VECTOR_DB_CLIENT.delete(
+                                    collection_name=collection_name,
+                                    ids=new_vector_ids,
+                                )
+                        raise
 
-        except Exception as e:
-            log.error(f'Error processing knowledge base {knowledge_base.id}: {str(e)}')
-            # Don't raise, just continue
-            continue
+                    for collection_name, vector_ids in old_vector_ids.items():
+                        if not vector_ids:
+                            continue
+                        await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=collection_name, ids=vector_ids)
+            except Exception as e:
+                log.error(f'Error processing file {file.filename} (ID: {file.id}): {str(e)}')
+                failed_files.append({'file_id': file.id, 'error': str(e)})
 
     if failed_files:
         log.warning(f'Failed to process {len(failed_files)} files')
         for failed in failed_files:
             log.warning(f'File ID: {failed["file_id"]}, Error: {failed["error"]}')
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f'Failed to reindex {len(failed_files)} of {total_files} files',
+        )
 
     log.info('Reindexing completed in %ss.', round(time.monotonic() - start_time))
     await publish_event(

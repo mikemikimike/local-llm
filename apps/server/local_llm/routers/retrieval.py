@@ -1844,6 +1844,10 @@ class ProcessFileForm(BaseModel):
     collection_name: str | None = None
 
 
+class ReindexProcessFileForm(ProcessFileForm):
+    """Process a file from its stored SQL content during a knowledge reindex."""
+
+
 def has_vector_results(result) -> bool:
     return bool(result and result.ids and result.ids[0])
 
@@ -1868,6 +1872,7 @@ async def process_file(
 
     if file:
         try:
+            reindex = isinstance(form_data, ReindexProcessFileForm)
             collection_name = form_data.collection_name
             file_collection_name = f'file-{file.id}'
 
@@ -1892,7 +1897,7 @@ async def process_file(
                     Document(
                         page_content=form_data.content.replace('<br/>', '\n'),
                         metadata={
-                            **file.meta,
+                            **(file.meta or {}),
                             'name': file.filename,
                             'created_by': file.user_id,
                             'file_id': file.id,
@@ -1913,7 +1918,21 @@ async def process_file(
                 )
                 stored_content = (file.data or {}).get('content')
 
-                if has_vector_results(file_result):
+                if reindex and stored_content is not None:
+                    docs = [
+                        Document(
+                            page_content=stored_content,
+                            metadata={
+                                **(file.meta or {}),
+                                'name': file.filename,
+                                'created_by': file.user_id,
+                                'file_id': file.id,
+                                'source': file.filename,
+                            },
+                        )
+                    ]
+                    collection_names.append(file_collection_name)
+                elif has_vector_results(file_result):
                     # Normal path: reuse the already-processed per-file chunks.
                     docs = [
                         Document(
@@ -1928,7 +1947,7 @@ async def process_file(
                         Document(
                             page_content=stored_content,
                             metadata={
-                                **file.meta,
+                                **(file.meta or {}),
                                 'name': file.filename,
                                 'created_by': file.user_id,
                                 'file_id': file.id,
@@ -1975,7 +1994,7 @@ async def process_file(
                         Document(
                             page_content=file.data.get('content', ''),
                             metadata={
-                                **file.meta,
+                                **(file.meta or {}),
                                 'name': file.filename,
                                 'created_by': file.user_id,
                                 'file_id': file.id,
@@ -2035,7 +2054,7 @@ async def process_file(
                                 'name': file.filename,
                                 'hash': hash,
                             },
-                            add=(True if form_data.collection_name else False),
+                            add=bool(form_data.collection_name),
                             user=user,
                         )
                     log.info('added %s items to collection %s', len(docs), collection_name)
@@ -3195,7 +3214,7 @@ async def process_files_batch(
                 Document(
                     page_content=text_content.replace('<br/>', '\n'),
                     metadata={
-                        **file.meta,
+                        **(file.meta or {}),
                         'name': file.filename,
                         'created_by': file.user_id,
                         'file_id': file.id,
