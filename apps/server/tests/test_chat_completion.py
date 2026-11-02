@@ -740,6 +740,47 @@ def test_chat_completion_matches_golden(monkeypatch, case_id, form, world):
     assert observed == _golden()[case_id]
 
 
+def test_custom_model_fallback_is_preserved_in_session_fanout(monkeypatch):
+    form = {
+        'model': 'custom',
+        'messages': [{'role': 'user', 'content': 'hi'}],
+        'session_id': 'sid',
+        'chat_id': 'local:sid',
+        'id': 'assistant-1',
+    }
+    world = {
+        'env': {'ENABLE_CUSTOM_MODEL_FALLBACK': True},
+        'config': {'ui.default_models': 'fallback'},
+    }
+
+    observed = _run(form, world, monkeypatch)
+    payload_calls = [call for call in observed['calls'] if call[0] == 'process_chat_payload']
+
+    assert [(call[1]['model'], call[2]) for call in payload_calls] == [('fallback', 'fallback')]
+
+
+def test_custom_model_fallback_remaps_only_its_multi_model_target(monkeypatch):
+    form = {
+        'model': 'custom',
+        'messages': [{'role': 'user', 'content': 'hi'}],
+        'session_id': 'sid',
+        'chat_id': 'local:sid',
+        'message_ids': [
+            {'model_id': 'custom', 'message_id': 'assistant-1'},
+            {'model_id': 'm2', 'message_id': 'assistant-2'},
+        ],
+    }
+    world = {
+        'env': {'ENABLE_CUSTOM_MODEL_FALLBACK': True},
+        'config': {'ui.default_models': 'fallback'},
+    }
+
+    observed = _run(form, world, monkeypatch)
+    payload_calls = [call for call in observed['calls'] if call[0] == 'process_chat_payload']
+
+    assert [(call[1]['model'], call[2]) for call in payload_calls] == [('fallback', 'fallback'), ('m2', 'm2')]
+
+
 def test_record_golden(monkeypatch):
     """Writes the golden file, only when CHAT_COMPLETION_GOLDEN_RECORD=1."""
     if not RECORD:

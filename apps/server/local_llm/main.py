@@ -1839,7 +1839,11 @@ async def chat_completion(
         form_data.pop('new_chat', None)  # Legacy field
 
         # Multi-model message_ids: list of {model_id, message_id} entries.
-        message_ids = _pop_message_ids(form_data, model_id)
+        message_ids = _pop_message_ids(form_data, fallback_model['id'] if fallback_model is not None else model_id)
+        if fallback_model is not None:
+            for entry in message_ids:
+                if entry['model_id'] == model_id:
+                    entry['model_id'] = fallback_model['id']
 
         user_message = form_data.pop('user_message', None) or form_data.pop('parent_message', None)
         chat_id = form_data.pop('chat_id', None) or ''
