@@ -1409,6 +1409,24 @@ def test_openrouter_mid_stream_error_chunk_is_saved_and_shown(monkeypatch):
     assert not [d for d in _emitted(observed, 'response:completion') if 'error' in d]
 
 
+def test_provider_error_after_tool_call_does_not_execute_tool(monkeypatch):
+    """A failed streamed completion must not run tool calls accumulated before the error."""
+    error = {'code': 502, 'message': 'Provider disconnected unexpectedly'}
+    failed_tool_stream = tool_call_stream('lookup', '{"q": 1}')[:-1] + [OPENROUTER_ERROR_CHUNK, DONE]
+    observed = _run(
+        [failed_tool_stream],
+        {'chat_id': SAVED_CHAT, 'tools': [tool('lookup', result={'should_not': 'run'})]},
+        {},
+        {},
+        None,
+        monkeypatch,
+    )
+
+    assert not [call for call in observed['calls'] if call[0] == 'tool']
+    assert {'error': {'content': error}} in _saved(observed)
+    assert {'error': error} in _emitted(observed)
+
+
 def test_finish_reason_error_without_an_error_object_is_still_an_error(monkeypatch):
     chunk_without_detail = sse({'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'error'}]})
     observed = _run([[chunk('Half'), chunk_without_detail, DONE]], {'chat_id': SAVED_CHAT}, {}, {}, None, monkeypatch)

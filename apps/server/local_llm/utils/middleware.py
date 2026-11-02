@@ -4874,7 +4874,7 @@ class _StreamingReply:
             if not line or line.isspace():
                 continue
             if not line.startswith('data:'):
-                await self._handle_plain_line(line)
+                await self._handle_plain_line(line, stream)
                 continue
             try:
                 if await self._handle_data_line(stream, line[5:].strip()):
@@ -4889,7 +4889,7 @@ class _StreamingReply:
         self._finish_stream_output()
         await self._queue_tool_calls(stream)
 
-    async def _handle_plain_line(self, data: str) -> None:
+    async def _handle_plain_line(self, data: str, stream: '_StreamPass') -> None:
         # Some upstreams return plain JSON error lines in a streaming response
         # (without SSE `data:` prefix). Try to normalize these into standard
         # error events so frontend and DB paths still receive them.
@@ -4897,6 +4897,7 @@ class _StreamingReply:
             raw_obj = JSONCodec.loads(data)
             raw_error = raw_obj.get('error') if isinstance(raw_obj, dict) else None
             if raw_error:
+                stream.provider_error = True
                 await self._save_error(raw_error)
                 await self.event_emitter({'type': 'chat:completion', 'data': {'error': raw_error}})
         except Exception:
@@ -4990,6 +4991,7 @@ class _StreamingReply:
                 response_metadata['usage'] = self.usage
 
             if response_metadata.get('error'):
+                stream.provider_error = True
                 await self.event_emitter(
                     {
                         'type': 'chat:completion',
@@ -5047,6 +5049,7 @@ class _StreamingReply:
         if not error and choices and choices[0].get('finish_reason') == 'error':
             error = {'message': 'The provider ended the reply with an error.'}
         if error:
+            stream.provider_error = True
             log.error('Provider returned error (streaming): %s', error)
             # Text still buffered goes out first, so the reply is not marked
             # failed (and done) before its last words arrive.
@@ -5453,6 +5456,8 @@ class _StreamingReply:
     async def _queue_tool_calls(self, stream: '_StreamPass') -> None:
         """Finish the streamed function_call items and queue their calls; or, for the Responses API, queue
         the function_call items that have no output yet."""
+        if stream.provider_error:
+            return
         if stream.response_tool_calls:
             for tc in stream.response_tool_calls:
                 call_id = tc.get('id', '')
@@ -5960,6 +5965,7 @@ class _StreamPass:
 
     def __init__(self, reply: _StreamingReply, form_data: dict):
         self.response_tool_calls = []
+        self.provider_error = False
         self.deltas = _DeltaBuffer(
             reply.event_emitter,
             reply.save_stream,
